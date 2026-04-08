@@ -44,9 +44,7 @@ DEFAULT_API_HASH = "6b64dd14b635b99d5bb820448542f45b"
 
 # Multiple bot tokens - replace with your own
 BOT_TOKENS = [
-    "8570477840:AAExpIlSizVeyy0fCiJMStfXZv0NjQOVg1U",   # example
-    "8720540502:AAHw4zUoP4QK0CJuT5coSal-kyrWFpFVXeo",   # add your second bot
-    "8676576721:AAHzJeqYNAC8u8sPxcxG3BWrq3VMwIt_axk"    # add your third bot
+    "8606888387:AAEQI2qfukba2tGZX33hXzvKIOU7t3sspHg"  # add your third bot
 ]
 
 # Owner(s) - super admins (only they can use recovery/scan commands)
