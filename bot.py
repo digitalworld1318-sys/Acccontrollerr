@@ -1,180 +1,136 @@
-import os
-import psycopg2
-from fastapi import FastAPI
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
-import cloudinary
-import cloudinary.uploader
+from flask import Flask, jsonify, request
+import requests
+import time
+import socket
+from functools import lru_cache
 
-app = FastAPI()
+app = Flask(__name__)
 
-# ================= CONFIG =================
+# -------------------------------
+# Instagram Fetch Function (Cached)
+# -------------------------------
+@lru_cache(maxsize=1024)
+def fetch_instagram_profile(username, proxy=None):
+    url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
 
-API_ID = 30567132
-API_HASH = "1f3e675de52fcfe4762e3ad5015f4ebc"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "x-ig-app-id": "936619743392459",
+        "Referer": f"https://www.instagram.com/{username}/",
+    }
 
-OWNER_KEY = "cyberxowner"
-USER_KEY = "cyberx"
+    session = requests.Session()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
 
-DATABASE_URL = "postgresql://password:0pJzUJ2gatvAR1fz7CQvDqH6GzZA7EWn@dpg-d7agi5udqaus73ctagrg-a.oregon-postgres.render.com/z4x_all_in_one_api"
+    backoff = 1
 
-cloudinary.config(
-    cloud_name="dwsyry63w",
-    api_key="862783951224336",
-    api_secret="uBiYjcfhNsIgEjrH_Iqw6dB190I"
-)
+    for _ in range(4):
+        try:
+            resp = session.get(url, headers=headers, timeout=10, proxies=proxies)
 
-# ================= DB =================
+            if resp.status_code == 200:
+                return resp.json()
 
-conn = psycopg2.connect(DATABASE_URL)
-cur = conn.cursor()
+            elif resp.status_code in (429, 403):
+                time.sleep(backoff)
+                backoff *= 2
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS sessions (
-    phone TEXT PRIMARY KEY,
-    session TEXT
-)
-""")
+            elif resp.status_code == 404:
+                return {"error": "not_found", "status_code": 404}
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS cache (
-    username TEXT PRIMARY KEY,
-    data TEXT
-)
-""")
+            else:
+                return {
+                    "error": "http_error",
+                    "status_code": resp.status_code,
+                    "body": resp.text[:300],
+                }
 
-conn.commit()
+        except requests.RequestException:
+            time.sleep(backoff)
+            backoff *= 2
 
-clients = {}
+    return {"error": "request_failed"}
 
-# ================= LOGIN =================
 
-@app.get("/login")
-async def login(key: str, num: str):
-    if key != OWNER_KEY:
-        return {"error": "Invalid key"}
+# -------------------------------
+# API Route
+# -------------------------------
+@app.route("/api/insta/<username>", methods=["GET"])
+def insta_info(username):
+    proxy = request.args.get("proxy")
 
-    phone = "+91" + num
+    data = fetch_instagram_profile(username, proxy)
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.connect()
-    await client.send_code_request(phone)
+    if not data:
+        return jsonify({"error": "no_response"}), 502
 
-    clients[num] = client
-
-    return {"status": "OTP sent"}
-
-# ================= VERIFY =================
-
-@app.get("/verify")
-async def verify(key: str, num: str, otp: str):
-    if key != OWNER_KEY:
-        return {"error": "Invalid key"}
-
-    phone = "+91" + num
-    client = clients.get(num)
-
-    if not client:
-        return {"error": "Login first"}
+    if "error" in data:
+        return jsonify(data), data.get("status_code", 400)
 
     try:
-        await client.sign_in(phone, otp)
-    except SessionPasswordNeededError:
-        return {"error": "2FA enabled"}
+        user = data.get("data", {}).get("user") or data.get("user")
 
-    session_str = client.session.save()
+        if not user:
+            return jsonify({"error": "invalid_response", "raw": data})
 
-    cur.execute(
-        "INSERT INTO sessions (phone, session) VALUES (%s, %s) ON CONFLICT (phone) DO UPDATE SET session=%s",
-        (num, session_str, session_str)
-    )
-    conn.commit()
-
-    return {"status": "Login successful"}
-
-# ================= GET CLIENT =================
-
-async def get_client():
-    cur.execute("SELECT session FROM sessions LIMIT 1")
-    row = cur.fetchone()
-
-    if not row:
-        return None
-
-    session_str = row[0]
-
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    await client.start()
-
-    return client
-
-# ================= SEARCH =================
-
-@app.get("/search")
-async def search(key: str, username: str):
-    if key != USER_KEY:
-        return {"error": "Invalid key"}
-
-    username = username.replace("@", "").strip()
-
-    # cache check
-    cur.execute("SELECT data FROM cache WHERE username=%s", (username,))
-    row = cur.fetchone()
-
-    if row:
-        return eval(row[0])
-
-    client = await get_client()
-
-    if not client:
-        return {"error": "No logged-in account"}
-
-    try:
-        user = await client.get_entity(username)
-
-        full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-
-        # total DP count
-        total_dp_obj = await client.get_profile_photos(user)
-        total_dp = total_dp_obj.total
-
-        # current DP
-        photos = await client.get_profile_photos(user, limit=1)
-
-        dp_url = None
-
-        if photos:
-            file_path = f"{username}_dp"
-
-            await client.download_media(photos[0], file_path)
-
-            res = cloudinary.uploader.upload(
-                file_path,
-                resource_type="auto"
-            )
-
-            dp_url = res["secure_url"]
-
-            if os.path.exists(file_path):
-                os.remove(file_path)
-
-        response = {
-            "id": user.id,
-            "username": user.username,
-            "full_name": full_name,
-            "total_dp": total_dp,
-            "current_dp": dp_url
+        result = {
+            "id": user.get("id"),
+            "username": user.get("username"),
+            "full_name": user.get("full_name"),
+            "biography": user.get("biography"),
+            "is_private": user.get("is_private"),
+            "is_verified": user.get("is_verified"),
+            "profile_pic": user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
+            "followers": user.get("edge_followed_by", {}).get("count") or user.get("followers_count"),
+            "following": user.get("edge_follow", {}).get("count") or user.get("following_count"),
+            "posts": user.get("edge_owner_to_timeline_media", {}).get("count") or user.get("media_count"),
+            "recent_posts": []
         }
 
-        # save cache
-        cur.execute(
-            "INSERT INTO cache (username, data) VALUES (%s, %s) ON CONFLICT (username) DO UPDATE SET data=%s",
-            (username, str(response), str(response))
-        )
-        conn.commit()
+        media = user.get("edge_owner_to_timeline_media", {})
+        edges = media.get("edges", [])
 
-        return response
+        for item in edges[:8]:
+            node = item.get("node", {})
+
+            caption = None
+            cap_edges = node.get("edge_media_to_caption", {}).get("edges", [])
+            if cap_edges:
+                caption = cap_edges[0].get("node", {}).get("text")
+
+            result["recent_posts"].append({
+                "id": node.get("id"),
+                "shortcode": node.get("shortcode"),
+                "image": node.get("display_url"),
+                "timestamp": node.get("taken_at_timestamp"),
+                "caption": caption
+            })
+
+        return jsonify(result)
 
     except Exception as e:
-        return {"error": str(e)}
+        return jsonify({
+            "error": "parse_error",
+            "details": str(e)
+        }), 500
+
+
+# -------------------------------
+# Auto Free Port Finder
+# -------------------------------
+def find_free_port(start=8080, end=9000):
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('127.0.0.1', port)) != 0:
+                return port
+    raise RuntimeError("No free port found")
+
+
+# -------------------------------
+# Run Server
+# -------------------------------
+if __name__ == "__main__":
+    port = find_free_port()
+    print(f"✅ Server running on http://127.0.0.1:{port}")
+    app.run(host="0.0.0.0", port=port)
