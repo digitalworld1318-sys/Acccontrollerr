@@ -1,2 +1,4 @@
+fastapi
 telethon
-aiohttp
+cloudinary
+psycopg2-binary
